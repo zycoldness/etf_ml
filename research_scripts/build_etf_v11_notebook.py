@@ -157,8 +157,11 @@ def build_v11_cost_summary(cost_weekly):
     if cost_weekly is None or cost_weekly.empty:
         return pd.DataFrame()
     group_cols = ["model_name", "target_name", "train_tag", "top_n", "group_cap", "min_avg_money_20", "money_threshold_tag"]
-    for keys, gdf in cost_weekly.groupby(group_cols, dropna=False):
+    grouped = cost_weekly.copy()
+    grouped[group_cols] = grouped[group_cols].fillna("__MISSING__")
+    for keys, gdf in grouped.groupby(group_cols):
         rec = dict(zip(group_cols, keys))
+        rec = {k: (np.nan if v == "__MISSING__" else v) for k, v in rec.items()}
         rec.update(_summary_with_prefix(gdf["net_ret"], "net"))
         rec.update(_summary_with_prefix(gdf["gross_ret"], "gross"))
         rec.update(_summary_with_prefix(gdf["median_ret"], "median"))
@@ -188,7 +191,9 @@ def build_v11_common_oos(cost_weekly):
         sub = data[data["feature_date"] >= pd.Timestamp(start)].copy()
         if sub.empty:
             continue
-        for (top_n, target_name), top_df in sub.groupby(["top_n", "target_name"], dropna=False):
+        sub[["top_n", "target_name"]] = sub[["top_n", "target_name"]].fillna("__MISSING__")
+        for (top_n, target_name), top_df in sub.groupby(["top_n", "target_name"]):
+            target_name_out = np.nan if target_name == "__MISSING__" else target_name
             date_sets = [set(pd.to_datetime(g["feature_date"]).dt.normalize()) for _, g in top_df.groupby("model_name")]
             if not date_sets:
                 continue
@@ -197,7 +202,7 @@ def build_v11_common_oos(cost_weekly):
                 continue
             common = top_df[top_df["feature_date"].isin(common_dates)].copy()
             for model_name, gdf in common.groupby("model_name"):
-                rec = {"common_oos_start": start, "model_name": model_name, "top_n": int(top_n), "target_name": target_name, "common_weeks": len(common_dates)}
+                rec = {"common_oos_start": start, "model_name": model_name, "top_n": int(float(top_n)), "target_name": target_name_out, "common_weeks": len(common_dates)}
                 rec.update(_summary_with_prefix(gdf["net_ret"], "net"))
                 rec.update(_summary_with_prefix(gdf["gross_ret"], "gross"))
                 rec.update(_summary_with_prefix(gdf["median_ret"], "median"))
@@ -246,7 +251,7 @@ def build_v11_cost_stability(cost_weekly):
     return out
 
 
-v11_cost_weekly_df = build_v11_cost_weekly(weekly_df, score_df)
+v11_cost_weekly_df = build_v11_cost_weekly(weekly_proxy_df, score_df)
 v11_cost_summary_df = build_v11_cost_summary(v11_cost_weekly_df)
 v11_common_oos_df = build_v11_common_oos(v11_cost_weekly_df)
 v11_cost_stability_df = build_v11_cost_stability(v11_cost_weekly_df)
