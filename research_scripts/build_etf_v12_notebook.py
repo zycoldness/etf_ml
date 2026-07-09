@@ -2,8 +2,8 @@ import json
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT_NOTEBOOK = ROOT / "机器学习策略" / "notebooks" / "ETF_V12_live_readiness_validation.ipynb"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+OUT_NOTEBOOK = PROJECT_DIR / "notebooks" / "ETF_V12_live_readiness_validation.ipynb"
 
 
 def source(text):
@@ -184,6 +184,39 @@ ETF_GROUP_RULES = [
 ]
 
 
+# Keep these keywords as Unicode escapes so this generator stays robust across
+# Windows code pages and JoinQuant notebook exports.
+ETF_GROUP_RULES = [
+    ("bank", ["\u94f6\u884c"]),
+    ("innovative_drug", ["\u521b\u65b0\u836f", "\u65b0\u836f", "\u533b\u836f", "\u533b\u7597", "\u751f\u7269", "\u836f"]),
+    ("oil_gas", ["\u6cb9\u6c14", "\u77f3\u6cb9", "\u80fd\u6e90", "\u5316\u5de5"]),
+    ("coal", ["\u7164\u70ad"]),
+    ("semiconductor", ["\u534a\u5bfc", "\u82af\u7247", "\u96c6\u6210\u7535\u8def"]),
+    ("software_ai", ["\u8f6f\u4ef6", "\u4eba\u5de5\u667a\u80fd", "AI", "\u4e91\u8ba1\u7b97", "\u5927\u6570\u636e", "\u8ba1\u7b97\u673a", "\u4fe1\u521b", "\u6e38\u620f", "\u901a\u4fe1", "\u7535\u5b50"]),
+    ("broker", ["\u8bc1\u5238", "\u5238\u5546"]),
+    ("military", ["\u519b\u5de5", "\u56fd\u9632", "\u822a\u7a7a\u822a\u5929", "\u901a\u7528\u822a\u7a7a"]),
+    ("gold", ["\u9ec4\u91d1"]),
+    ("nonferrous", ["\u6709\u8272", "\u7a00\u6709\u91d1\u5c5e", "\u7a00\u571f"]),
+    ("consumer", ["\u6d88\u8d39", "\u98df\u54c1", "\u9152"]),
+    ("real_estate", ["\u5730\u4ea7", "\u623f\u5730\u4ea7"]),
+    ("new_energy", ["\u65b0\u80fd\u6e90", "\u5149\u4f0f", "\u7535\u6c60", "\u9502\u7535", "\u50a8\u80fd", "\u79d1\u521b\u65b0\u80fd"]),
+    ("cross_border", ["\u7eb3\u6307", "\u6807\u666e", "\u6052\u751f", "\u6e2f\u80a1", "\u65e5\u7ecf", "\u5fb7\u56fd", "\u6cd5\u56fd", "\u6d77\u5916", "QDII", "\u4e9a\u592a"]),
+    ("broad", ["\u6caa\u6df1300", "\u4e2d\u8bc1500", "\u4e2d\u8bc11000", "\u521b\u4e1a\u677f", "\u79d1\u521b", "\u4e0a\u8bc150", "A500"]),
+]
+
+
+def missing_or_blank(series):
+    return series.isnull() | (series.astype(str).str.strip() == "")
+
+
+def group_quality(series):
+    valid = series[~missing_or_blank(series)].astype(str)
+    missing_ratio = float(missing_or_blank(series).mean())
+    unique_groups = int(valid.nunique()) if len(valid) else 0
+    max_group_share = float(valid.value_counts(normalize=True).iloc[0]) if len(valid) else 1.0
+    return missing_ratio, unique_groups, max_group_share
+
+
 def classify_etf_group(name):
     if name is None or pd.isnull(name) or str(name).strip() == "":
         return np.nan
@@ -213,12 +246,12 @@ def enrich_names(df, date=None):
         out["name"] = np.nan
     if "etf_group" not in out.columns:
         out["etf_group"] = np.nan
-    needs = out["name"].isnull() | (out["name"].astype(str).str.strip() == "")
+    needs = missing_or_blank(out["name"])
     if needs.any():
         name_map = try_jq_name_map(date=date)
         if name_map:
             out.loc[needs, "name"] = out.loc[needs, "code"].map(name_map)
-    group_missing = out["etf_group"].isnull() | (out["etf_group"].astype(str).str.strip() == "")
+    group_missing = missing_or_blank(out["etf_group"])
     out.loc[group_missing, "etf_group"] = out.loc[group_missing, "name"].map(classify_etf_group)
     return out
 
@@ -299,14 +332,20 @@ for label, df in [("weekly_cost", weekly_cost), ("weekly_proxy", weekly_proxy), 
     qcheck("%s_rows" % label, "PASS" if df is not None and len(df) > 0 else "FAIL", "%s rows=%s" % (label, 0 if df is None else len(df)), "ERROR" if df is None or len(df) == 0 else "INFO")
 
 if "name" in latest_targets.columns:
-    name_missing = float(latest_targets["name"].isnull().mean())
+    name_missing = float(missing_or_blank(latest_targets["name"]).mean())
     qcheck("latest_target_names", "PASS" if name_missing < 0.05 else "FAIL", "missing_ratio=%.3f" % name_missing, "ERROR" if name_missing >= 0.05 else "INFO")
 else:
     qcheck("latest_target_names", "FAIL", "name column missing", "ERROR")
 
 if "etf_group" in latest_targets.columns:
-    group_missing = float(latest_targets["etf_group"].isnull().mean())
+    group_missing, group_unique, group_max_share = group_quality(latest_targets["etf_group"])
     qcheck("latest_target_groups", "PASS" if group_missing < 0.10 else "FAIL", "missing_ratio=%.3f" % group_missing, "ERROR" if group_missing >= 0.10 else "INFO")
+    qcheck(
+        "latest_target_group_diversity",
+        "PASS" if group_unique > 1 or len(latest_targets) < 5 else "WARN",
+        "unique_groups=%d max_group_share=%.3f" % (group_unique, group_max_share),
+        "WARN" if group_unique <= 1 and len(latest_targets) >= 5 else "INFO",
+    )
 else:
     qcheck("latest_target_groups", "FAIL", "etf_group column missing", "ERROR")
 
@@ -651,13 +690,16 @@ for top_n, gdf0 in weekly_cost.groupby("top_n"):
     rule_weekly_parts.append(consensus_df)
 
 # Theme cap readiness check.
-group_missing = latest_targets["etf_group"].isnull().mean() if "etf_group" in latest_targets.columns else 1.0
+if "etf_group" in latest_targets.columns:
+    group_missing, group_unique, group_max_share = group_quality(latest_targets["etf_group"])
+else:
+    group_missing, group_unique, group_max_share = 1.0, 0, 1.0
 rule_rows.append({
     "rule_name": "theme_cap_readiness",
     "model_name": "all",
     "top_n": np.nan,
-    "blocked": bool(group_missing > 0.10),
-    "block_reason": "ETF group missing ratio %.3f" % group_missing,
+    "blocked": bool(group_missing > 0.10 or (len(latest_targets) >= 5 and group_unique <= 1)),
+    "block_reason": "ETF group missing ratio %.3f; unique_groups=%d; max_group_share=%.3f" % (group_missing, group_unique, group_max_share),
 })
 
 portfolio_rules_df = pd.DataFrame(rule_rows)
@@ -681,8 +723,10 @@ def score_item(item, status, detail, severity="INFO"):
 
 name_fail = data_quality_df[(data_quality_df["check"] == "latest_target_names") & (data_quality_df["status"] != "PASS")]
 group_fail = data_quality_df[(data_quality_df["check"] == "latest_target_groups") & (data_quality_df["status"] != "PASS")]
+group_diversity_warn = data_quality_df[(data_quality_df["check"] == "latest_target_group_diversity") & (data_quality_df["status"] != "PASS")]
 score_item("data_quality_names", "PASS" if name_fail.empty else "FAIL", "ETF names must be available for live drawdown attribution.", "ERROR" if not name_fail.empty else "INFO")
 score_item("data_quality_groups", "PASS" if group_fail.empty else "FAIL", "ETF groups must be available for theme cap and concentration checks.", "ERROR" if not group_fail.empty else "INFO")
+score_item("data_quality_group_diversity", "PASS" if group_diversity_warn.empty else "WARN", "ETF group classification should not collapse all selected funds into one bucket.", "WARN" if not group_diversity_warn.empty else "INFO")
 
 baseline_blocked = baseline_availability_df[baseline_availability_df["status"] != "PASS"]
 score_item("simple_baselines", "PASS" if baseline_blocked.empty else "BLOCKED_MISSING_DATA", "Blocked baselines: %s" % baseline_blocked["baseline"].tolist(), "WARN" if not baseline_blocked.empty else "INFO")
