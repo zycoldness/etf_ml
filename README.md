@@ -29,6 +29,7 @@ ETF machine-learning rotation research focused on validation from 2021 onward.
   - Label-only model experiment for fixed `top3`.
   - Compares `ret5d`, `alpha5d`, `rank5d`, and explicitly blocks `ret10d`/`alpha10d`/`rank10d` when the panel lacks 10-day labels.
   - Matches label horizon to holding period: 5-day labels use weekly rebalance and `future_ret_5d`; 10-day labels use 2-week rebalance and `future_ret_10d`.
+  - Does not require V11 exports: if `etf_ml_v14_weekly_panel.csv` is absent, it rebuilds the ETF weekly panel from JoinQuant `jqdata` in the research environment.
   - Keeps V10 features, model settings, and liquidity floor fixed to avoid mixed-dimension overfitting.
 - `research_scripts/build_etf_v14_label_experiment_notebook.py`
   - Rebuilds the V14 notebook.

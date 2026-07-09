@@ -47,6 +47,12 @@ whether the model should learn absolute return, excess return, or cross-sectiona
 ranking before we touch features, parameters, or weak-signal filters. Longer
 labels are evaluated with matching holding periods so we do not accidentally
 test a 10-day target with a 5-day trading rule.
+
+Data rule:
+
+- The notebook prefers an existing V14 panel cache only to save time.
+- If no cache exists, it rebuilds the ETF weekly panel directly in JoinQuant
+  research via `jqdata`, including both 5-day and 10-day labels.
 """
 ))
 
@@ -64,6 +70,12 @@ import numpy as np
 import pandas as pd
 
 try:
+    from jqdata import *  # noqa: F401,F403
+    JQ_IMPORT_ERROR = None
+except Exception as err:
+    JQ_IMPORT_ERROR = err
+
+try:
     from IPython.display import display
 except Exception:
     def display(x):
@@ -78,11 +90,23 @@ os.makedirs(OUT_DIR, exist_ok=True)
 INPUT_DIR_CANDIDATES = [
     "G:/",
     ".",
+    "etf_ml_v14_label_experiment_outputs",
+    "../etf_ml_v14_label_experiment_outputs",
     "etf_ml_v11_2021_validation_outputs",
     "../etf_ml_v11_2021_validation_outputs",
 ]
 
-WEEKLY_PANEL_FILE = "etf_ml_v11_weekly_panel.csv"
+WEEKLY_PANEL_FILES = [
+    "etf_ml_v14_weekly_panel.csv",
+    "etf_ml_v11_weekly_panel.csv",  # legacy cache name; not required
+]
+PANEL_CACHE_CSV = os.path.join(OUT_DIR, "etf_ml_v14_weekly_panel.csv")
+DATA_START_DATE = "2021-01-01"
+DATA_END_DATE = "2026-06-30"
+LISTING_DAYS_MIN = 60
+PRICE_HISTORY_COUNT = 140
+JQ_CHUNK_SIZE = 80
+LABEL_HORIZONS = [5, 10]
 MIN_AVG_MONEY_20 = 50000000.0
 TOP_N = 3
 COST_RATE = 0.0001
@@ -154,20 +178,271 @@ LGB_PARAMS = {
 NUM_BOOST_ROUND = 180
 
 
-def find_input_file(fname):
-    for base in INPUT_DIR_CANDIDATES:
-        path = os.path.join(base, fname)
-        if os.path.exists(path):
-            return path
+def find_input_file(fnames):
+    for fname in fnames:
+        for base in INPUT_DIR_CANDIDATES:
+            path = os.path.join(base, fname)
+            if os.path.exists(path):
+                return path
     return None
 
 
-panel_path = find_input_file(WEEKLY_PANEL_FILE)
-if panel_path is None:
-    raise FileNotFoundError("Missing %s" % WEEKLY_PANEL_FILE)
+def jq_ready():
+    return all(name in globals() for name in ["get_price", "get_all_securities", "get_trade_days"])
 
-panel_raw = pd.read_csv(panel_path)
-print("loaded panel", panel_raw.shape, "from", panel_path)
+
+def chunked(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def normalize_price_df(px):
+    if px is None:
+        return pd.DataFrame()
+    df = px.copy()
+    if isinstance(df, pd.Series):
+        df = df.to_frame().reset_index()
+    elif isinstance(df, pd.DataFrame):
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index()
+        elif "time" not in df.columns and "date" not in df.columns and "datetime" not in df.columns:
+            df = df.reset_index()
+    else:
+        try:
+            df = df.to_frame(filter_observations=False).reset_index()
+        except Exception:
+            return pd.DataFrame()
+
+    rename_map = {}
+    for c in df.columns:
+        lc = str(c).lower()
+        if lc in ["index", "level_0", "datetime", "date"]:
+            rename_map[c] = "time"
+        elif lc in ["level_1", "security", "order_book_id"]:
+            rename_map[c] = "code"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], errors="coerce").dt.normalize()
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str)
+    return df
+
+
+def get_jq_trade_days(start_date, end_date):
+    tdays = get_trade_days(start_date=start_date, end_date=end_date)  # noqa: F405
+    return pd.to_datetime(list(tdays)).normalize()
+
+
+def weekly_feature_dates(trade_days):
+    s = pd.Series(pd.to_datetime(trade_days).normalize()).dropna().sort_values()
+    if s.empty:
+        return []
+    return sorted(s.groupby(s.dt.to_period("W-FRI")).max().dropna().tolist())
+
+
+def get_etf_universe(date):
+    sec = get_all_securities(["etf"], date=date)  # noqa: F405
+    if sec is None or sec.empty:
+        return []
+    sec = sec.copy()
+    if "start_date" in sec.columns:
+        start_dates = pd.to_datetime(sec["start_date"], errors="coerce")
+        sec = sec[start_dates <= pd.Timestamp(date) - pd.Timedelta(days=LISTING_DAYS_MIN)]
+    return sorted(sec.index.astype(str).tolist())
+
+
+def trend_metrics(close, w):
+    y = pd.Series(close).dropna().astype(float).tail(w)
+    if len(y) < max(5, int(w * 0.6)):
+        return {"ann": np.nan, "r2": np.nan, "score": np.nan, "vol": np.nan, "score_vol_adj": np.nan, "simple_ann": np.nan}
+    ret = y.pct_change().dropna()
+    vol = float(ret.std() * math.sqrt(252.0)) if len(ret) > 1 else np.nan
+    x = np.arange(len(y), dtype=float)
+    log_y = np.log(y.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(log_y) < max(5, int(w * 0.6)):
+        return {"ann": np.nan, "r2": np.nan, "score": np.nan, "vol": vol, "score_vol_adj": np.nan, "simple_ann": np.nan}
+    x = np.arange(len(log_y), dtype=float)
+    slope, intercept = np.polyfit(x, log_y.values, 1)
+    pred = intercept + slope * x
+    ss_res = float(((log_y.values - pred) ** 2).sum())
+    ss_tot = float(((log_y.values - log_y.values.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    ann = float(np.exp(slope * 252.0) - 1.0)
+    simple_ann = float((y.iloc[-1] / y.iloc[0]) ** (252.0 / max(1, len(y) - 1)) - 1.0) if y.iloc[0] > 0 else np.nan
+    score = ann * max(0.0, r2)
+    score_vol_adj = score / max(vol, 0.01) if pd.notnull(vol) else np.nan
+    return {"ann": ann, "r2": float(r2), "score": score, "vol": vol, "score_vol_adj": score_vol_adj, "simple_ann": simple_ann}
+
+
+def pct_ret(close, n):
+    s = pd.Series(close).dropna().astype(float)
+    if len(s) <= n or s.iloc[-n - 1] <= 0:
+        return np.nan
+    return float(s.iloc[-1] / s.iloc[-n - 1] - 1.0)
+
+
+def calc_feature_record(code, g):
+    g = g.sort_values("time").copy()
+    close = g["close"].astype(float)
+    high = g["high"].astype(float) if "high" in g.columns else close
+    low = g["low"].astype(float) if "low" in g.columns else close
+    volume = g["volume"].astype(float) if "volume" in g.columns else pd.Series(np.nan, index=g.index)
+    money = g["money"].astype(float) if "money" in g.columns else pd.Series(np.nan, index=g.index)
+    if len(close.dropna()) < 65:
+        return None
+    rec = {"code": code}
+    for n in [1, 5, 10, 20, 60]:
+        rec["ret_%s" % n] = pct_ret(close, n)
+    daily_ret = close.pct_change()
+    for n in [5, 20, 60]:
+        rec["vol_%s" % n] = float(daily_ret.tail(n).std() * math.sqrt(252.0)) if daily_ret.tail(n).notnull().sum() > 1 else np.nan
+    ma5 = close.tail(5).mean()
+    ma20 = close.tail(20).mean()
+    ma60 = close.tail(60).mean()
+    rec["close_to_ma20"] = float(close.iloc[-1] / ma20 - 1.0) if ma20 > 0 else np.nan
+    rec["close_to_ma60"] = float(close.iloc[-1] / ma60 - 1.0) if ma60 > 0 else np.nan
+    rec["ma5_to_ma20"] = float(ma5 / ma20 - 1.0) if ma20 > 0 else np.nan
+    rec["ma20_to_ma60"] = float(ma20 / ma60 - 1.0) if ma60 > 0 else np.nan
+    for n in [20, 60]:
+        c = close.tail(n)
+        h = high.tail(n)
+        l = low.tail(n)
+        rec["drawdown_%s" % n] = float(close.iloc[-1] / c.max() - 1.0) if c.max() > 0 else np.nan
+        rec["amp_%s" % n] = float(h.max() / l.min() - 1.0) if l.min() > 0 else np.nan
+    rec["money_mean_20"] = float(money.tail(20).mean())
+    rec["money_ratio_5_20"] = float(money.tail(5).mean() / money.tail(20).mean()) if money.tail(20).mean() > 0 else np.nan
+    rec["money_ratio_20_60"] = float(money.tail(20).mean() / money.tail(60).mean()) if money.tail(60).mean() > 0 else np.nan
+    rec["volume_ratio_5_20"] = float(volume.tail(5).mean() / volume.tail(20).mean()) if volume.tail(20).mean() > 0 else np.nan
+    rec["volume_ratio_20_60"] = float(volume.tail(20).mean() / volume.tail(60).mean()) if volume.tail(60).mean() > 0 else np.nan
+    rec["max_ret_20"] = float(daily_ret.tail(20).max())
+    rec["min_ret_20"] = float(daily_ret.tail(20).min())
+    for w in TREND_WINDOWS:
+        tm = trend_metrics(close, w)
+        rec["trend_ann_%s" % w] = tm["ann"]
+        rec["trend_r2_%s" % w] = tm["r2"]
+        rec["trend_score_%s" % w] = tm["score"]
+        rec["trend_vol_%s" % w] = tm["vol"]
+        rec["trend_score_vol_adj_%s" % w] = tm["score_vol_adj"]
+        rec["trend_simple_ann_%s" % w] = tm["simple_ann"]
+    return rec
+
+
+def fetch_feature_frame(feature_date, codes):
+    fields = ["open", "close", "high", "low", "volume", "money"]
+    rows = []
+    for part in chunked(codes, JQ_CHUNK_SIZE):
+        try:
+            px = get_price(part, end_date=feature_date, frequency="daily", fields=fields, count=PRICE_HISTORY_COUNT, panel=False, fq="pre", skip_paused=False)  # noqa: F405
+        except Exception as err:
+            print("get_price feature failed", feature_date, len(part), err)
+            continue
+        df = normalize_price_df(px)
+        if df.empty or "code" not in df.columns or "close" not in df.columns:
+            continue
+        for code, g in df.groupby("code"):
+            rec = calc_feature_record(code, g)
+            if rec is not None:
+                rec["feature_date"] = pd.Timestamp(feature_date)
+                rec["rebalance_date"] = pd.Timestamp(feature_date)
+                rows.append(rec)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    if "money_mean_20" in out.columns:
+        out = out[out["money_mean_20"] >= MIN_AVG_MONEY_20].copy()
+    for col in RAW_FEATURE_COLS:
+        if col in out.columns:
+            out["rank_" + col] = out[col].rank(pct=True)
+    out["pool_breadth_%s" % POOL_CONTEXT_WINDOW] = float((out.get("ret_20", pd.Series(dtype=float)) > 0).mean())
+    out["pool_median_vol_%s" % POOL_CONTEXT_WINDOW] = float(out.get("vol_20", pd.Series(dtype=float)).median())
+    return out
+
+
+def fetch_future_returns_multi(feature_date, codes, horizons, trade_days):
+    trade_days = pd.to_datetime(trade_days).normalize()
+    feature_date = pd.Timestamp(feature_date).normalize()
+    idx_arr = np.where(trade_days == feature_date)[0]
+    if len(idx_arr) == 0:
+        return pd.DataFrame()
+    start_idx = int(idx_arr[0])
+    max_h = max(horizons)
+    if start_idx + max_h >= len(trade_days):
+        return pd.DataFrame()
+    horizon_dates = {h: pd.Timestamp(trade_days[start_idx + h]).normalize() for h in horizons}
+    rows = []
+    for part in chunked(codes, JQ_CHUNK_SIZE):
+        try:
+            px = get_price(part, start_date=feature_date, end_date=horizon_dates[max_h], frequency="daily", fields=["close"], panel=False, fq="pre", skip_paused=False)  # noqa: F405
+        except Exception as err:
+            print("get_price label failed", feature_date, len(part), err)
+            continue
+        df = normalize_price_df(px)
+        if df.empty or "code" not in df.columns or "close" not in df.columns:
+            continue
+        for code, g in df.groupby("code"):
+            g = g.sort_values("time")
+            base = g[g["time"] <= feature_date]["close"].dropna()
+            if base.empty or float(base.iloc[-1]) <= 0:
+                continue
+            rec = {"code": code, "feature_date": feature_date}
+            base_close = float(base.iloc[-1])
+            for h, dt in horizon_dates.items():
+                fut = g[g["time"] <= dt]["close"].dropna()
+                rec["next_date_%sd" % h] = dt
+                rec["future_ret_%sd" % h] = float(fut.iloc[-1] / base_close - 1.0) if not fut.empty else np.nan
+            rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def build_weekly_panel_from_jq():
+    if not jq_ready():
+        detail = "jqdata unavailable"
+        if JQ_IMPORT_ERROR is not None:
+            detail += ": %s" % JQ_IMPORT_ERROR
+        raise RuntimeError(
+            "No cached V14 panel found and %s. Run this notebook in JoinQuant research, "
+            "or provide etf_ml_v14_weekly_panel.csv." % detail
+        )
+    trade_days = get_jq_trade_days(DATA_START_DATE, DATA_END_DATE)
+    feature_dates = weekly_feature_dates(trade_days)
+    rows = []
+    print("building V14 weekly panel from JoinQuant", DATA_START_DATE, DATA_END_DATE, "weeks", len(feature_dates))
+    for i, feature_date in enumerate(feature_dates):
+        if i % 20 == 0:
+            print("panel week", i + 1, "/", len(feature_dates), feature_date)
+        codes = get_etf_universe(feature_date)
+        if not codes:
+            continue
+        feature_df = fetch_feature_frame(feature_date, codes)
+        if feature_df.empty:
+            continue
+        label_df = fetch_future_returns_multi(feature_date, feature_df["code"].tolist(), LABEL_HORIZONS, trade_days)
+        if label_df.empty:
+            continue
+        week = feature_df.merge(label_df, on=["code", "feature_date"], how="left")
+        if "next_date_5d" in week.columns:
+            week["next_date"] = week["next_date_5d"]
+        rows.append(week)
+    panel = pd.concat(rows, ignore_index=True, sort=False) if rows else pd.DataFrame()
+    if panel.empty:
+        raise RuntimeError("JoinQuant panel rebuild produced no rows; check ETF universe and date range.")
+    panel.to_csv(PANEL_CACHE_CSV, index=False)
+    try:
+        panel.to_csv("etf_ml_v14_weekly_panel.csv", index=False)
+    except Exception:
+        pass
+    print("built panel", panel.shape, "saved", PANEL_CACHE_CSV)
+    return panel
+
+
+panel_path = find_input_file(WEEKLY_PANEL_FILES)
+if panel_path is not None:
+    panel_raw = pd.read_csv(panel_path)
+    print("loaded cached panel", panel_raw.shape, "from", panel_path)
+else:
+    panel_raw = build_weekly_panel_from_jq()
 '''
 ))
 
