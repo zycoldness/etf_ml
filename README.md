@@ -13,6 +13,18 @@ ETF machine-learning rotation research focused on validation from 2021 onward.
   - Common-OOS, turnover, cost, random baseline, simple momentum/trend baseline, and stability diagnostics.
 - `research_scripts/build_etf_v11_notebook.py`
   - Rebuilds the V11 notebook from the prior V10 research notebook template.
+- `notebooks/ETF_V12_live_readiness_validation.ipynb`
+  - Live-readiness validation from V11 outputs.
+  - Flags missing score panels, ETF metadata, capacity, turnover, and theme concentration blockers.
+- `research_scripts/build_etf_v12_notebook.py`
+  - Rebuilds the V12 notebook.
+- `notebooks/ETF_V13_live_gate_validation.ipynb`
+  - Full live-gate validation after `etf_ml_v11_score_panel.csv` and `etf_ml_v11_weekly_panel.csv` are available.
+  - Tests ML score vs momentum/trend/equal-weight/random/median baselines, cost stress, turnover, capacity, common OOS, and target-schedule export.
+- `research_scripts/build_etf_v13_live_gate_notebook.py`
+  - Rebuilds the V13 notebook.
+- `strategies/joinquant_etf_ml_v13_targets_strategy.py`
+  - JoinQuant target-schedule strategy template. Paste the generated `TARGET_SCHEDULE` from V13 before backtesting.
 - `docs/specs/2026-07-08-etf-v11-validation-design.md`
   - Experiment design.
 - `docs/plans/2026-07-08-etf-v11-validation-notebook.md`
