@@ -27,8 +27,9 @@ ETF machine-learning rotation research focused on validation from 2021 onward.
   - JoinQuant target-schedule strategy template. Paste the generated `TARGET_SCHEDULE` from V13 before backtesting.
 - `notebooks/ETF_V14_label_experiment.ipynb`
   - Label-only model experiment for fixed `top3`.
-  - Compares `ret5d`, `alpha5d`, `rank5d`, and explicitly blocks `ret10d` when the panel lacks 10-day labels.
-  - Keeps V10 features, model settings, liquidity floor, and evaluation rules fixed to avoid mixed-dimension overfitting.
+  - Compares `ret5d`, `alpha5d`, `rank5d`, and explicitly blocks `ret10d`/`alpha10d`/`rank10d` when the panel lacks 10-day labels.
+  - Matches label horizon to holding period: 5-day labels use weekly rebalance and `future_ret_5d`; 10-day labels use 2-week rebalance and `future_ret_10d`.
+  - Keeps V10 features, model settings, and liquidity floor fixed to avoid mixed-dimension overfitting.
 - `research_scripts/build_etf_v14_label_experiment_notebook.py`
   - Rebuilds the V14 notebook.
 - `docs/specs/2026-07-08-etf-v11-validation-design.md`

@@ -29,22 +29,24 @@ V14-A tests one optimization dimension only: **training target / label**.
 Fixed controls:
 
 - Trading rule: top3 equal weight
-- Rebalance: weekly
+- Rebalance: label-matched (`5d` labels weekly, `10d` labels every 2 weeks)
 - Liquidity floor: `money_mean_20 >= 5000w`
 - Features: V10 feature set, unchanged
 - Model parameters: V10 LightGBM params, unchanged when LightGBM is available
-- Evaluation return: always `future_ret_5d`
+- Evaluation return: label-matched (`future_ret_5d` for 5-day labels, `future_ret_10d` for 10-day labels)
 
 Candidate labels:
 
 - `ret5d`: absolute future 5-day return
 - `alpha5d`: future 5-day return minus weekly ETF-pool median return
 - `rank5d`: weekly cross-sectional percentile rank of future 5-day return
-- `ret10d`: only if `future_ret_10d` exists in the input panel; otherwise explicitly blocked
+- `ret10d` / `alpha10d` / `rank10d`: only if `future_ret_10d` exists in the input panel; otherwise explicitly blocked
 
 The value of this experiment is not "find the prettiest curve"; it tells us
 whether the model should learn absolute return, excess return, or cross-sectional
-ranking before we touch features, parameters, or weak-signal filters.
+ranking before we touch features, parameters, or weak-signal filters. Longer
+labels are evaluated with matching holding periods so we do not accidentally
+test a 10-day target with a 5-day trading rule.
 """
 ))
 
@@ -251,22 +253,33 @@ if "target_alpha_5d" not in panel.columns:
 
 panel["target_rank_5d"] = panel.groupby("feature_date")["future_ret_5d"].rank(pct=True)
 
+if "future_ret_10d" in panel.columns:
+    if "target_alpha_10d" not in panel.columns:
+        panel["target_alpha_10d"] = panel["future_ret_10d"] - panel.groupby("feature_date")["future_ret_10d"].transform("median")
+    panel["target_rank_10d"] = panel.groupby("feature_date")["future_ret_10d"].rank(pct=True)
+
 available_features = [c for c in unique_keep_order(FEATURE_COLS) if c in panel.columns]
 missing_features = [c for c in unique_keep_order(FEATURE_COLS) if c not in panel.columns]
 print("panel after filters", panel.shape)
 print("feature count", len(available_features), "missing", len(missing_features))
 
 label_specs = [
-    {"label_name": "ret5d", "target_col": "future_ret_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date"},
-    {"label_name": "alpha5d", "target_col": "target_alpha_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date"},
-    {"label_name": "rank5d", "target_col": "target_rank_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date"},
+    {"label_name": "ret5d", "target_col": "future_ret_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date", "horizon_days": 5, "rebalance_interval_weeks": 1},
+    {"label_name": "alpha5d", "target_col": "target_alpha_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date", "horizon_days": 5, "rebalance_interval_weeks": 1},
+    {"label_name": "rank5d", "target_col": "target_rank_5d", "eval_ret_col": "future_ret_5d", "next_col": "next_date", "horizon_days": 5, "rebalance_interval_weeks": 1},
 ]
 if "future_ret_10d" in panel.columns:
-    label_specs.append({"label_name": "ret10d", "target_col": "future_ret_10d", "eval_ret_col": "future_ret_5d", "next_col": "next_date_10d" if "next_date_10d" in panel.columns else "next_date"})
+    next_10d_col = "next_date_10d" if "next_date_10d" in panel.columns else "next_date"
+    label_specs.extend([
+        {"label_name": "ret10d", "target_col": "future_ret_10d", "eval_ret_col": "future_ret_10d", "next_col": next_10d_col, "horizon_days": 10, "rebalance_interval_weeks": 2},
+        {"label_name": "alpha10d", "target_col": "target_alpha_10d", "eval_ret_col": "future_ret_10d", "next_col": next_10d_col, "horizon_days": 10, "rebalance_interval_weeks": 2},
+        {"label_name": "rank10d", "target_col": "target_rank_10d", "eval_ret_col": "future_ret_10d", "next_col": next_10d_col, "horizon_days": 10, "rebalance_interval_weeks": 2},
+    ])
 
 blocked_labels = []
 if "future_ret_10d" not in panel.columns:
-    blocked_labels.append({"label_name": "ret10d", "status": "BLOCKED_MISSING_DATA", "detail": "future_ret_10d not found; rebuild panel with LABEL_HORIZONS=[5, 10]."})
+    for missing_label in ["ret10d", "alpha10d", "rank10d"]:
+        blocked_labels.append({"label_name": missing_label, "status": "BLOCKED_MISSING_DATA", "detail": "future_ret_10d not found; rebuild panel with LABEL_HORIZONS=[5, 10]."})
 
 display(pd.DataFrame(label_specs))
 if blocked_labels:
@@ -308,8 +321,8 @@ def fit_numpy_ridge(X, y, feature_cols, alpha=10.0):
     return NumpyRidgeModel(coef, mean, scale, feature_cols)
 
 
-def clean_train_df(df, target_col):
-    cols = unique_keep_order(["code", "feature_date", "next_date", "next_date_5d", target_col, "future_ret_5d"] + available_features)
+def clean_train_df(df, target_col, eval_ret_col, next_col):
+    cols = unique_keep_order(["code", "feature_date", next_col, target_col, eval_ret_col] + available_features)
     cols = [c for c in cols if c in df.columns]
     out = df.loc[:, cols].replace([np.inf, -np.inf], np.nan)
     out = out[~out[target_col].isnull()].copy()
@@ -360,9 +373,15 @@ manifest_rows = []
 for spec in label_specs:
     label_name = spec["label_name"]
     target_col = spec["target_col"]
+    eval_ret_col = spec["eval_ret_col"]
     next_col = spec["next_col"]
+    horizon_days = int(spec["horizon_days"])
+    rebalance_interval_weeks = int(spec["rebalance_interval_weeks"])
     if target_col not in panel.columns:
         blocked_labels.append({"label_name": label_name, "status": "BLOCKED_MISSING_DATA", "detail": "%s missing" % target_col})
+        continue
+    if eval_ret_col not in panel.columns:
+        blocked_labels.append({"label_name": label_name, "status": "BLOCKED_MISSING_DATA", "detail": "%s missing" % eval_ret_col})
         continue
     if next_col not in panel.columns:
         next_col = "next_date"
@@ -371,14 +390,17 @@ for spec in label_specs:
         train_end_ts = pd.Timestamp(train_end)
         train_mask = (panel["feature_date"] >= train_start_ts) & (panel[next_col] <= train_end_ts)
         score_mask = panel["feature_date"] > train_end_ts
-        train_df = clean_train_df(panel.loc[train_mask], target_col)
-        score_base_cols = unique_keep_order(["code", "feature_date", "next_date", "future_ret_5d", target_col] + available_features)
+        train_df = clean_train_df(panel.loc[train_mask], target_col, eval_ret_col, next_col)
+        score_base_cols = unique_keep_order(["code", "feature_date", next_col, eval_ret_col, target_col] + available_features)
         score_base_cols = [c for c in score_base_cols if c in panel.columns]
         score_base = panel.loc[score_mask, score_base_cols].copy()
         if train_df.empty or score_base.empty:
             manifest_rows.append({
                 "label_name": label_name,
                 "target_col": target_col,
+                "eval_ret_col": eval_ret_col,
+                "horizon_days": horizon_days,
+                "rebalance_interval_weeks": rebalance_interval_weeks,
                 "train_tag": train_tag,
                 "status": "SKIPPED_EMPTY",
                 "train_samples": int(len(train_df)),
@@ -387,10 +409,16 @@ for spec in label_specs:
             continue
         print("training", label_name, train_tag, "train", train_df.shape, "score", score_base.shape)
         model, fill_values, backend = train_model(train_df, target_col)
-        scored = score_base[["code", "feature_date", "next_date", "future_ret_5d"]].copy()
+        scored = score_base[["code", "feature_date", next_col, eval_ret_col]].copy()
+        if next_col != "next_date":
+            scored = scored.rename(columns={next_col: "next_date"})
+        scored["eval_ret"] = score_base[eval_ret_col].values
         scored["score"] = predict_model(model, fill_values, score_base)
         scored["label_name"] = label_name
         scored["target_col"] = target_col
+        scored["eval_ret_col"] = eval_ret_col
+        scored["horizon_days"] = horizon_days
+        scored["rebalance_interval_weeks"] = rebalance_interval_weeks
         scored["train_tag"] = train_tag
         scored["train_start"] = train_start
         scored["train_end"] = train_end
@@ -400,6 +428,9 @@ for spec in label_specs:
         manifest_rows.append({
             "label_name": label_name,
             "target_col": target_col,
+            "eval_ret_col": eval_ret_col,
+            "horizon_days": horizon_days,
+            "rebalance_interval_weeks": rebalance_interval_weeks,
             "train_tag": train_tag,
             "backend": backend,
             "status": "TRAINED",
@@ -427,24 +458,43 @@ display(blocked_labels_df)
 cells.append(code_cell(
     r'''
 # =========================
-# 4. Top3 Weekly Evaluation
+# 4. Top3 Matched-Holding Evaluation
 # =========================
-def baseline_ret(gdf, col):
-    if col not in gdf.columns:
+def baseline_ret(gdf, col, eval_ret_col):
+    if col not in gdf.columns or eval_ret_col not in gdf.columns:
         return np.nan
-    x = gdf.dropna(subset=[col, "future_ret_5d"]).copy()
+    x = gdf.dropna(subset=[col, eval_ret_col]).copy()
     if x.empty:
         return np.nan
-    return float(x.sort_values(col, ascending=False).head(min(TOP_N, len(x)))["future_ret_5d"].mean())
+    return float(x.sort_values(col, ascending=False).head(min(TOP_N, len(x)))[eval_ret_col].mean())
 
 
+def scheduled_score_data(score_data):
+    parts = []
+    if score_data.empty:
+        return score_data.copy()
+    for model_name, gdf0 in score_data.groupby("model_name"):
+        interval = int(gdf0["rebalance_interval_weeks"].iloc[0]) if "rebalance_interval_weeks" in gdf0.columns else 1
+        interval = max(1, interval)
+        dates = sorted(pd.to_datetime(gdf0["feature_date"]).dropna().unique())
+        keep_dates = set(pd.Timestamp(dt).normalize() for idx, dt in enumerate(dates) if idx % interval == 0)
+        gdf = gdf0.copy()
+        feature_dates = pd.to_datetime(gdf["feature_date"]).dt.normalize()
+        parts.append(gdf.loc[feature_dates.isin(keep_dates)].copy())
+    return pd.concat(parts, ignore_index=True, sort=False) if parts else score_data.iloc[0:0].copy()
+
+
+score_eval_df = scheduled_score_data(score_df)
 weekly_rows = []
-if not score_df.empty:
-    feature_baseline_cols = ["code", "feature_date", "future_ret_5d", "ret_20", "ret_60", "trend_score_25", "trend_score_60"]
+if not score_eval_df.empty:
+    feature_baseline_cols = ["code", "feature_date", "future_ret_5d", "future_ret_10d", "ret_20", "ret_60", "trend_score_25", "trend_score_60"]
     feature_baseline_cols = [c for c in feature_baseline_cols if c in panel.columns]
     panel_eval = panel[feature_baseline_cols].copy()
-    for (model_name, label_name, train_tag, feature_date), gdf0 in score_df.groupby(["model_name", "label_name", "train_tag", "feature_date"]):
-        gdf = gdf0.dropna(subset=["score", "future_ret_5d"]).sort_values("score", ascending=False)
+    for (model_name, label_name, train_tag, feature_date), gdf0 in score_eval_df.groupby(["model_name", "label_name", "train_tag", "feature_date"]):
+        eval_ret_col = gdf0["eval_ret_col"].iloc[0]
+        horizon_days = int(gdf0["horizon_days"].iloc[0])
+        rebalance_interval_weeks = int(gdf0["rebalance_interval_weeks"].iloc[0])
+        gdf = gdf0.dropna(subset=["score", "eval_ret"]).sort_values("score", ascending=False)
         if gdf.empty:
             continue
         top = gdf.head(min(TOP_N, len(gdf)))
@@ -453,7 +503,7 @@ if not score_df.empty:
         vals = []
         n = min(TOP_N, len(universe))
         for seed in RANDOM_SEEDS:
-            vals.append(float(universe.sample(n, random_state=seed)["future_ret_5d"].mean()))
+            vals.append(float(universe.sample(n, random_state=seed)["eval_ret"].mean()))
         base_week = panel_eval[panel_eval["feature_date"] == feature_date]
         weekly_rows.append({
             "model_name": model_name,
@@ -462,15 +512,18 @@ if not score_df.empty:
             "backend": top["backend"].iloc[0],
             "feature_date": feature_date,
             "top_n": TOP_N,
-            "gross_ret": float(top["future_ret_5d"].mean()),
-            "median_ret": float(universe["future_ret_5d"].median()),
-            "equal_weight_ret": float(universe["future_ret_5d"].mean()),
+            "horizon_days": horizon_days,
+            "rebalance_interval_weeks": rebalance_interval_weeks,
+            "eval_ret_col": eval_ret_col,
+            "gross_ret": float(top["eval_ret"].mean()),
+            "median_ret": float(universe["eval_ret"].median()),
+            "equal_weight_ret": float(universe["eval_ret"].mean()),
             "random_mean_ret": float(np.mean(vals)),
             "random_median_ret": float(np.median(vals)),
-            "ret20_top3_ret": baseline_ret(base_week, "ret_20"),
-            "ret60_top3_ret": baseline_ret(base_week, "ret_60"),
-            "trend25_top3_ret": baseline_ret(base_week, "trend_score_25"),
-            "trend60_top3_ret": baseline_ret(base_week, "trend_score_60"),
+            "ret20_top3_ret": baseline_ret(base_week, "ret_20", eval_ret_col),
+            "ret60_top3_ret": baseline_ret(base_week, "ret_60", eval_ret_col),
+            "trend25_top3_ret": baseline_ret(base_week, "trend_score_25", eval_ret_col),
+            "trend60_top3_ret": baseline_ret(base_week, "trend_score_60", eval_ret_col),
             "targets": "|".join(codes),
             "target_count": int(len(codes)),
         })
@@ -512,6 +565,9 @@ summary_rows = []
 for keys, gdf in weekly_df.groupby(["label_name", "train_tag", "model_name", "backend"]):
     label_name, train_tag, model_name, backend = keys
     rec = {"label_name": label_name, "train_tag": train_tag, "model_name": model_name, "backend": backend}
+    rec["horizon_days"] = int(gdf["horizon_days"].iloc[0]) if "horizon_days" in gdf.columns else np.nan
+    rec["rebalance_interval_weeks"] = int(gdf["rebalance_interval_weeks"].iloc[0]) if "rebalance_interval_weeks" in gdf.columns else np.nan
+    rec["eval_ret_col"] = gdf["eval_ret_col"].iloc[0] if "eval_ret_col" in gdf.columns else ""
     rec.update(add_summary("net", gdf["net_ret"]))
     rec.update(add_summary("gross", gdf["gross_ret"]))
     rec.update(add_summary("stress_net", gdf["stress_net_ret"]))
@@ -541,6 +597,9 @@ for start in COMMON_OOS_STARTS:
     for keys, gdf in sub.groupby(["label_name", "train_tag", "model_name", "backend"]):
         label_name, train_tag, model_name, backend = keys
         rec = {"common_oos_start": start, "label_name": label_name, "train_tag": train_tag, "model_name": model_name, "backend": backend, "weeks": int(len(gdf))}
+        rec["horizon_days"] = int(gdf["horizon_days"].iloc[0]) if "horizon_days" in gdf.columns else np.nan
+        rec["rebalance_interval_weeks"] = int(gdf["rebalance_interval_weeks"].iloc[0]) if "rebalance_interval_weeks" in gdf.columns else np.nan
+        rec["eval_ret_col"] = gdf["eval_ret_col"].iloc[0] if "eval_ret_col" in gdf.columns else ""
         rec.update(add_summary("net", gdf["net_ret"]))
         rec.update(add_summary("stress_net", gdf["stress_net_ret"]))
         rec.update(add_summary("median", gdf["median_ret"]))
@@ -559,6 +618,9 @@ for label_name, gdf in summary_df.groupby("label_name"):
     decision_rows.append({
         "label_name": label_name,
         "trained_models": int(gdf["model_name"].nunique()),
+        "horizon_days": int(gdf["horizon_days"].iloc[0]) if "horizon_days" in gdf.columns else np.nan,
+        "rebalance_interval_weeks": int(gdf["rebalance_interval_weeks"].iloc[0]) if "rebalance_interval_weeks" in gdf.columns else np.nan,
+        "eval_ret_col": gdf["eval_ret_col"].iloc[0] if "eval_ret_col" in gdf.columns else "",
         "best_net_cum_ret": float(gdf["net_cum_ret"].max()),
         "median_net_cum_ret": float(gdf["net_cum_ret"].median()),
         "worst_net_cum_ret": float(gdf["net_cum_ret"].min()),
@@ -602,6 +664,7 @@ lines.append("- Fixed features: V10 feature set, available feature count `%d`" %
 lines.append("- Fixed cost: base `%s`, stress `%s`" % (COST_RATE, COST_STRESS_RATE))
 lines.append("- Backends used: `%s`" % ", ".join(backend_set))
 lines.append("- This experiment changes only training labels.")
+lines.append("- Holding-period match: `5d` labels use weekly rebalance and `future_ret_5d`; `10d` labels use 2-week rebalance and `future_ret_10d`.")
 lines.append("")
 if blocked_labels:
     lines.append("## Blocked Labels")
@@ -611,8 +674,11 @@ if blocked_labels:
 lines.append("## Label Decision Matrix")
 if not decision_df.empty:
     for _, r in decision_df.iterrows():
-        lines.append("- `%s`: best=%s median=%s worst=%s common_pass=%.2f simple_pass=%.2f median_turnover=%.3f" % (
+        lines.append("- `%s`: horizon=%sd rebalance=%sw eval=%s best=%s median=%s worst=%s common_pass=%.2f simple_pass=%.2f median_turnover=%.3f" % (
             r["label_name"],
+            int(r["horizon_days"]) if not pd.isnull(r["horizon_days"]) else -1,
+            int(r["rebalance_interval_weeks"]) if not pd.isnull(r["rebalance_interval_weeks"]) else -1,
+            r["eval_ret_col"],
             fmt_pct(r["best_net_cum_ret"]),
             fmt_pct(r["median_net_cum_ret"]),
             fmt_pct(r["worst_net_cum_ret"]),
@@ -626,8 +692,8 @@ lines.append("")
 lines.append("## Best Rows")
 if not summary_df.empty:
     for _, r in summary_df.head(15).iterrows():
-        lines.append("- `%s` `%s`: net=%s mdd=%s random=%s equal=%s stress=%s turnover=%.3f backend=%s" % (
-            r["label_name"], r["train_tag"], fmt_pct(r["net_cum_ret"]), fmt_pct(r["net_max_drawdown"]),
+        lines.append("- `%s` `%s`: horizon=%sd rebalance=%sw net=%s mdd=%s random=%s equal=%s stress=%s turnover=%.3f backend=%s" % (
+            r["label_name"], r["train_tag"], int(r["horizon_days"]), int(r["rebalance_interval_weeks"]), fmt_pct(r["net_cum_ret"]), fmt_pct(r["net_max_drawdown"]),
             fmt_pct(r["random_mean_cum_ret"]), fmt_pct(r["equal_weight_cum_ret"]),
             fmt_pct(r["stress_net_cum_ret"]), float(r["avg_turnover"]), r["backend"]
         ))
@@ -636,7 +702,7 @@ lines.append("## Interpretation Rules")
 lines.append("- A label is valuable if it improves median/common-OOS behavior, not merely one best row.")
 lines.append("- If a label underperforms `ret5d`, that is useful evidence to avoid adding that objective to the production ensemble.")
 lines.append("- If `rank5d` is steadier but lower-return, use it as an ensemble stabilizer rather than the sole target.")
-lines.append("- `ret10d` remains untested until the weekly panel is rebuilt with 10-day labels.")
+lines.append("- `ret10d`/`alpha10d`/`rank10d` remain untested until the weekly panel is rebuilt with 10-day labels; once available, they are evaluated as 2-week holding strategies.")
 
 report_text = "\n".join(lines) + "\n"
 report_path = os.path.join(OUT_DIR, "etf_ml_v14_report.md")
